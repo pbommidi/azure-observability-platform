@@ -1,4 +1,4 @@
-# Azure Observability Workshop — Day 2
+# Azure Observability
 
 **A two-cluster AKS observability platform, built with Terraform, deployed with Helm, secured with Azure Workload Identity — with every real bug left in the story.**
 
