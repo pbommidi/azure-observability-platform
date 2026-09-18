@@ -32,9 +32,7 @@
 
 ## What This Is
 
-Day 1 of this workshop ran a single Prometheus instance on a single Azure VM. It worked — and it had a single point of failure that was also the thing that would have told you about the failure.
-
-Day 2 rebuilds this as a real platform: two AKS clusters, Prometheus running highly available, long-term metrics in Azure Blob Storage via Thanos, logs in Loki, traces in Tempo, all collected by Grafana Alloy from a real (small) application, all authenticated to Azure with **zero static credentials** — every component uses Azure Workload Identity instead of a storage key.
+Two AKS clusters, Prometheus running highly available, long-term metrics in Azure Blob Storage via Thanos, logs in Loki, traces in Tempo, all collected by Grafana Alloy from a real (small) application, all authenticated to Azure with **zero static credentials** — every component uses Azure Workload Identity instead of a storage key.
 
 Everything here was provisioned with Terraform and deployed with Helm, and every configuration decision below is backed by something that actually happened during the build — including four separate Helm charts each hiding their configuration in a different, undocumented place, and one afternoon spent proving that a `#` is not a `//`.
 
