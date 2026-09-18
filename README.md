@@ -1,9 +1,9 @@
-# Azure Observability
+# Azure Observability Platform
 
-**A two-cluster AKS observability platform, built with Terraform, deployed with Helm, secured with Azure Workload Identity — with every real bug left in the story.**
+A highly available observability stack on Azure — two peered AKS clusters, Prometheus running twice with Thanos handling deduplication and long-term storage, Loki for logs, Tempo for traces, all fed by a single Grafana Alloy agent, all authenticated with Azure Workload Identity instead of a password. Built with Terraform, deployed with Helm.
 
 > [!NOTE]
-> This README documents what was actually built and debugged during this workshop. Where something wasn't implemented (CI/CD, automated tests), it's labeled **Future Work**, not glossed over.
+> This README describes what's actually running in this repository. Where something isn't implemented — CI/CD, automated tests — it's marked as future work rather than implied.
 
 ---
 
@@ -32,11 +32,11 @@
 
 ## What This Is
 
-Day 1 of this workshop ran a single Prometheus instance on a single Azure VM. It worked — and it had a single point of failure that was also the thing that would have told you about the failure.
+The starting point for this project was a single Prometheus instance on a single Azure VM. It worked fine, and it had the obvious problem every single-instance monitoring setup has: the thing that's supposed to tell you something broke is itself a single point of failure.
 
-Day 2 rebuilds this as a real platform: two AKS clusters, Prometheus running highly available, long-term metrics in Azure Blob Storage via Thanos, logs in Loki, traces in Tempo, all collected by Grafana Alloy from a real (small) application, all authenticated to Azure with **zero static credentials** — every component uses Azure Workload Identity instead of a storage key.
+This repository is the fix. Two AKS clusters — one running the application being observed, one running the observability platform itself — connected by a private network peering. Prometheus runs as two independent replicas. Thanos ships their data to Azure Blob Storage for long-term retention and deduplicates the two replicas at query time. Loki holds logs, Tempo holds traces, and Grafana Alloy collects all three signals from the application in one pass, with consistent labels across all of them. Every component that needs to write to storage does so through Azure Workload Identity — there's no password or key anywhere in this codebase, by design.
 
-Everything here was provisioned with Terraform and deployed with Helm, and every configuration decision below is backed by something that actually happened during the build — including four separate Helm charts each hiding their configuration in a different, undocumented place, and one afternoon spent proving that a `#` is not a `//`.
+Everything here, including the Kubernetes and Helm layer on top of the raw Azure infrastructure, is provisioned by Terraform. The Challenges section further down is not filler — it covers four separate Helm charts that each hid their real configuration behavior somewhere the values schema didn't make obvious, and one genuinely frustrating stretch spent figuring out that Alloy's config language uses `//` for comments, not `#`.
 
 ---
 
@@ -122,7 +122,7 @@ flowchart TB
     User["You"] -->|Explore UI| Grafana
 ```
 
-### Simplified view (for beginners)
+### Simplified view
 
 ```mermaid
 flowchart LR
@@ -139,7 +139,7 @@ flowchart LR
     Tempo --> Grafana
 ```
 
-### Workload identity flow (no passwords, anywhere)
+### Workload identity flow
 
 ```mermaid
 flowchart LR
@@ -152,11 +152,11 @@ flowchart LR
 ```
 
 > [!NOTE]
-> **Generating a static PNG:** GitHub renders the Mermaid blocks above natively — no extra step needed to view them. If you want a portable image for a slide deck or LinkedIn post, export any block with the [Mermaid CLI](https://github.com/mermaid-js/mermaid-cli):
+> GitHub renders these Mermaid diagrams natively, so there's nothing to do to view them. For a portable PNG (a slide deck, a LinkedIn post), export any block with the [Mermaid CLI](https://github.com/mermaid-js/mermaid-cli):
 > ```bash
 > npx @mermaid-js/mermaid-cli -i docs/architecture.mmd -o docs/day2-architecture.png
 > ```
-> This repository does not currently include a pre-rendered `docs/day2-architecture.png` — the Mermaid source above is the single source of truth.
+> There's no pre-rendered image checked into this repo — the Mermaid source above is the actual source of truth.
 
 ---
 
@@ -164,71 +164,71 @@ flowchart LR
 
 | Layer | Technology | Purpose |
 |---|---|---|
-| IaC | Terraform (`azurerm`, `kubernetes`, `helm`, `random` providers) | Provisions Azure infra AND Kubernetes/Helm resources from one state file |
-| Compute | Azure Kubernetes Service (AKS) ×2 | Application cluster + monitoring cluster |
-| Networking | Azure VNet + Peering | Network isolation with an explicit, controlled path between clusters |
-| Metrics | Prometheus (`kube-prometheus-stack`), 2 replicas | Scraping and short-term local storage |
+| IaC | Terraform (`azurerm`, `kubernetes`, `helm`, `random` providers) | Provisions Azure infrastructure and the in-cluster Kubernetes/Helm layer from one state file |
+| Compute | Azure Kubernetes Service ×2 | Application cluster and monitoring cluster |
+| Networking | Azure VNet + Peering | Isolated networks, one explicit path between them |
+| Metrics | Prometheus (`kube-prometheus-stack`), 2 replicas | Scraping, short-term local storage |
 | Long-term metrics | Thanos (Sidecar + Query) | Deduplication across HA replicas, long-term storage in Blob |
-| Logs | Loki (SingleBinary mode) | Log aggregation, indexed by label |
-| Traces | Tempo | Distributed tracing, indexed by trace ID only |
+| Logs | Loki (SingleBinary) | Log aggregation, indexed by label |
+| Traces | Tempo | Distributed tracing, indexed by trace ID |
 | Collection | Grafana Alloy (DaemonSet) | One agent, three signals, consistent labels |
-| Visualization | Grafana | Unified query layer across Thanos, Loki, Tempo |
-| Identity | Azure Workload Identity (OIDC federation) | Zero static credentials for any storage access |
-| Object storage | Azure Blob Storage (4 containers) | Backing store for Thanos, Loki, Tempo |
+| Visualization | Grafana | One query layer across Thanos, Loki, and Tempo |
+| Identity | Azure Workload Identity (OIDC federation) | No static credentials for storage access |
+| Object storage | Azure Blob Storage, 4 containers | Backing store for Thanos, Loki, Tempo |
 
 ---
 
 ## Prerequisites
 
-- An Azure subscription. **Free Trial subscriptions have a hard 4 vCPU regional cap that blocks a two-cluster build** — see [Challenges](#challenges-and-troubleshooting). Pay-As-You-Go (with the free trial credit still applied) is recommended.
-- `az` CLI, authenticated (`az login`)
-- `terraform` >= 1.9
+- An Azure subscription. Free Trial subscriptions carry a hard 4 vCPU regional cap that blocks a two-cluster build outright — see [Challenges](#challenges-and-troubleshooting). Pay-As-You-Go, with the free trial credit still applied, is what this was actually built on.
+- `az` CLI, authenticated
+- Terraform >= 1.9
 - `kubectl`
-- `helm` (used for `helm show values` / `helm template` inspection during development; not required at deploy time since Terraform's `helm` provider drives the actual releases)
-- A budget alert configured on the subscription before deploying anything (Cost Management + Billing → Budgets)
+- `helm` — used for `helm show values` / `helm template` during development, not required at deploy time since the `helm` provider drives the actual releases
+- A budget alert on the subscription, set before deploying anything
 
 ---
 
 ## Repository Structure
 
-A single Terraform working directory, not a multi-module project — but split into one file per concern for readability, rather than one ~1350-line `main.tf`. File boundaries are purely organizational: Terraform reads every `.tf` file in the directory as one configuration regardless of which file a block lives in, so this split changes nothing about what gets built (verified with `terraform plan` showing zero diff against the pre-split version).
+One Terraform working directory, split into a file per concern rather than one long `main.tf`. Terraform reads every `.tf` file in a directory as a single configuration regardless of which file a block lives in, so the split is purely organizational — verified with `terraform plan` showing zero diff before and after.
 
 ```
 azure-observability-framework/
 ├── .gitignore            # Excludes *.tfstate, .terraform/, *.tfvars, .DS_Store
 └── terraform/
-    ├── providers.tf       # terraform{}, azurerm provider, and the default +
+    ├── providers.tf       # terraform{}, the azurerm provider, and the default +
     │                      #   aliased kubernetes/helm provider pairs
     ├── network.tf         # Resource group, both VNets, both subnets, peering
     ├── clusters.tf        # Both azurerm_kubernetes_cluster resources
-    ├── storage.tf         # Storage account + its 4 containers
+    ├── storage.tf         # Storage account and its 4 containers
     ├── identity.tf        # Workload identities, federated credentials,
-    │                      #   per-container RBAC, the cluster's own
+    │                      #   per-container RBAC, and the cluster's own
     │                      #   Network Contributor grant on vnet-mon
-    ├── prometheus.tf      # kube-prometheus-stack + the Thanos sidecar's
+    ├── prometheus.tf      # kube-prometheus-stack, plus the Thanos sidecar's
     │                      #   ServiceAccount and object-storage Secret
     ├── thanos-query.tf    # Thanos Query — a plain Deployment/Service,
     │                      #   not a Helm chart (see Design Deep Dives)
-    ├── grafana.tf         # Grafana admin Secret + helm_release
-    ├── loki.tf            # Loki helm_release + its standalone internal
+    ├── grafana.tf         # Admin Secret + helm_release
+    ├── loki.tf            # helm_release, plus a standalone internal
     │                      #   LoadBalancer Service
-    ├── tempo.tf           # Tempo helm_release
-    ├── alloy.tf           # aks-app's namespace, Alloy helm_release
-    │                      #   (provider = helm.app), and its OTLP Service
-    ├── demo-app.tf        # The Flask demo application
-    ├── variables.tf       # Region, node size/count, CIDR ranges, tags
-    ├── output.tf          # Cluster names, subnet IDs, OIDC issuer URLs,
-    │                      #   identity client IDs, storage account name,
-    │                      #   Grafana admin password (sensitive)
-    ├── example.tfvars     # Copy to terraform.tfvars — the handful of
-    │                      #   values worth reviewing before your first apply
-    └── .terraform.lock.hcl   # Pinned provider versions
+    ├── tempo.tf            # helm_release
+    ├── alloy.tf            # aks-app's namespace, the Alloy helm_release
+    │                       #   (provider = helm.app), and its OTLP Service
+    ├── demo-app.tf         # The Flask demo application
+    ├── variables.tf        # Region, node size/count, CIDR ranges, tags
+    ├── output.tf           # Cluster names, subnet IDs, OIDC issuer URLs,
+    │                       #   identity client IDs, storage account name,
+    │                       #   Grafana admin password (sensitive)
+    ├── example.tfvars      # Copy to terraform.tfvars — the handful of
+    │                       #   values worth checking before your first apply
+    └── .terraform.lock.hcl # Pinned provider versions
 ```
 
 > [!NOTE]
-> `terraform.tfstate` is **not** committed (it's in `.gitignore`) and is not part of this repository — it contains the storage account's resource IDs and the Grafana admin password in plaintext. Anyone cloning this repo runs `terraform init && terraform apply` against their own fresh state.
+> `terraform.tfstate` is gitignored and isn't part of this repository — it holds resource IDs and the Grafana admin password in plaintext. Cloning this repo and running `terraform init && terraform apply` builds you a fresh, independent environment; it doesn't attach to anything.
 
-A `modules/`, `tests/`, or `docs/` split does not exist yet in this repository — see [Future Improvements](#future-improvements).
+There's no `modules/`, `tests/`, or `docs/` split yet — see [Future Improvements](#future-improvements).
 
 ---
 
@@ -236,17 +236,16 @@ A `modules/`, `tests/`, or `docs/` split does not exist yet in this repository �
 
 ```bash
 cd terraform
-cp example.tfvars terraform.tfvars   # review location/node_size first — see
-                                      #   Prerequisites and Challenges #1–2
-                                      #   before assuming the defaults fit
-                                      #   your subscription's quota
+cp example.tfvars terraform.tfvars   # check location and node_size against your
+                                      #   own subscription's quota before applying —
+                                      #   see Prerequisites and Challenges #1–2
 terraform init
 terraform plan
 terraform apply
 ```
 
 > [!IMPORTANT]
-> Every `kubectl ... --context aks-mon` / `--context aks-app` command in this README (and there are many, throughout Validation, Command Reference, and Challenges) depends on those two contexts existing in your local kubeconfig. Terraform's own `kubernetes`/`helm` providers **don't** need this step — they read cluster credentials directly from `azurerm_kubernetes_cluster.*.kube_config` — but *you*, running `kubectl` by hand afterward, do:
+> Every `kubectl ... --context aks-mon` / `--context aks-app` command in this README needs those two contexts to exist in your local kubeconfig. Terraform's own providers don't need this — they read cluster credentials straight off `azurerm_kubernetes_cluster.*.kube_config` — but running `kubectl` by hand afterward does:
 > ```bash
 > az aks get-credentials -g $(terraform output -raw resource_group_name) \
 >   -n $(terraform output -raw mon_cluster_name) --context aks-mon
@@ -254,17 +253,15 @@ terraform apply
 >   -n $(terraform output -raw app_cluster_name) --context aks-app
 > ```
 
-`terraform apply` provisions, in dependency order (inferred automatically from resource references, never hand-written):
+`terraform apply` provisions, in an order Terraform infers automatically from resource references rather than anything hand-written:
 
-1. Resource group, both VNets, both subnets, VNet peering (bidirectional — Azure models peering as a property of *each* network, so it's two resources, not one)
-2. Both AKS clusters (parallel — no reference between them)
-3. Storage account + 4 containers
-4. 3 user-assigned managed identities + federated credentials + per-container RBAC
-5. `kube-prometheus-stack` (Prometheus HA + Thanos sidecar), Thanos Query, Grafana, Loki, Tempo — all in `aks-mon`
-6. Grafana Alloy — in `aks-app`, via a **second, aliased** set of `kubernetes`/`helm` provider configurations (see [Terraform](#terraform))
-7. The demo application — in `aks-app`
-
-After the network layer, everything else is a `helm_release` or a plain `kubernetes_*` resource — Terraform owns the full lifecycle, not just the Azure layer.
+1. Resource group, both VNets, both subnets, the peering (two resources, not one — Azure models a peering as a property of each network)
+2. Both AKS clusters, in parallel, since nothing references the other
+3. Storage account and its 4 containers
+4. Three managed identities, their federated credentials, and per-container RBAC
+5. `kube-prometheus-stack` (Prometheus HA and the Thanos sidecar), Thanos Query, Grafana, Loki, Tempo — all in `aks-mon`
+6. Grafana Alloy, in `aks-app`, through a second, aliased set of `kubernetes`/`helm` provider configs (see [Terraform](#terraform))
+7. The demo application, also in `aks-app`
 
 ```bash
 kubectl get pods -n monitoring --context aks-mon
@@ -277,46 +274,40 @@ kubectl get pods -n monitoring --context aks-app
 
 ### Why two AKS clusters
 
-The observability platform monitors systems it does not trust with elevated access. Putting the workload and the monitoring stack in one network means everything can reach everything by default. Two clusters, two VNets, with the only path between them being an explicit, auditable peering connection, means the telemetry path is something you can see and control — not an implicit consequence of shared infrastructure. It also isolates blast radius: a misconfiguration or compromise in the application cluster doesn't automatically expose the observability stack, and vice versa.
+An observability platform ends up with elevated access into whatever it's watching. Put the workload and the platform in one network and everything can reach everything by default. Two clusters, two VNets, with a single explicit peering as the only path between them, means the telemetry path is something you can actually see and control rather than an implicit side effect of shared infrastructure. It also caps blast radius — a compromise or misconfiguration in the application cluster doesn't automatically expose the platform watching it, and the reverse holds too.
 
 ### Network separation and connectivity
 
-`vnet-app` (`10.10.0.0/16`) and `vnet-mon` (`10.20.0.0/16`) are peered with `allow_virtual_network_access` and `allow_forwarded_traffic` set on both sides. Two properties matter:
+`vnet-app` (`10.10.0.0/16`) and `vnet-mon` (`10.20.0.0/16`) are peered with `allow_virtual_network_access` and `allow_forwarded_traffic` on both sides. Two things matter here:
 
-- **Only real VNet address space is routable across the peering.** Pod IPs (`10.244.0.0/16` / `10.245.0.0/16`, Azure CNI overlay ranges) and Kubernetes Service virtual IPs (`172.16.0.0/16` / `172.17.0.0/16`) are cluster-internal and **never** cross the peering — regardless of network connectivity. `*.svc.cluster.local` DNS names resolve only inside the cluster that owns them.
-- Consequently, anything in `aks-app` that needs to reach something in `aks-mon` (Alloy reaching Prometheus, Loki, Tempo) needs a Service with a **real private IP from the node subnet** on the `aks-mon` side — a `type: LoadBalancer` Service annotated `service.beta.kubernetes.io/azure-load-balancer-internal: "true"`. This is not optional plumbing; it's the only mechanism that actually crosses the boundary. See the internal load balancer addresses in [Alloy](#alloy) below.
+Only real VNet address space is routable across the peering. Pod IPs (the Azure CNI overlay ranges) and Kubernetes Service virtual IPs are cluster-internal and never cross it, regardless of how the networks are connected — `*.svc.cluster.local` names resolve only inside the cluster that owns them.
+
+So anything in `aks-app` that needs to reach something in `aks-mon` — Alloy reaching Prometheus, Loki, or Tempo — needs a Service with a real private IP from the node subnet on the `aks-mon` side: a `LoadBalancer` Service annotated `service.beta.kubernetes.io/azure-load-balancer-internal: "true"`. That's not an optional refinement; it's the only mechanism that actually crosses the boundary. The addresses are in the [Alloy](#alloy) section below.
 
 ### Terraform
 
 | Concept | What it means here |
 |---|---|
-| **Provider** | A plugin translating HCL into an API. Four in use: `azurerm` (Azure), `kubernetes` and `helm` (each with a **default** instance pointed at `aks-mon` and an **aliased** instance, `kubernetes.app`/`helm.app`, pointed at `aks-app`), and `random` (admin password, storage-account name suffix) |
-| **Resource** | A declared thing that should exist — `azurerm_kubernetes_cluster`, `helm_release`, `kubernetes_service`, etc. |
-| **Variable** | Typed inputs (region, node size, CIDR ranges) with a rejected-at-plan-time type, not a runtime failure |
-| **Output** | The declared interface other configs (or a human) may depend on — cluster names, subnet IDs, OIDC issuer URLs, identity client IDs |
-| **State** | Terraform's record mapping declared resources to real Azure/Kubernetes object IDs. Only what's in state is managed; anything created out-of-band (see [Challenges](#challenges-and-troubleshooting)) is invisible to it until imported |
-| **Dependency graph / implicit dependencies** | Built entirely from HCL references — `azurerm_subnet.mon_aks.id` used inside a cluster resource creates the edge. `depends_on` is used sparingly, only where a Helm values string (a hardcoded Kubernetes DNS name) has no Terraform attribute to reference |
-| **Idempotency** | `terraform apply` run twice with no drift reports `0 changed`. Demonstrated repeatedly during this build via a recurring, harmless AKS `upgrade_settings` drift (Azure re-asserting its own default surge-upgrade config) |
-| **Provider chaining** | The `kubernetes`/`helm` provider blocks read their credentials directly from `azurerm_kubernetes_cluster.mon.kube_config[0]` / `.app.kube_config[0]` — no separate `az aks get-credentials` step, no kubeconfig file on disk required for Terraform's own operations |
+| Provider | A plugin translating HCL into an API. Four in use: `azurerm`, `kubernetes` and `helm` (each with a default instance pointed at `aks-mon` and an aliased instance, `kubernetes.app`/`helm.app`, pointed at `aks-app`), and `random` for the admin password and storage-account suffix |
+| Resource | A declared thing that should exist — `azurerm_kubernetes_cluster`, `helm_release`, `kubernetes_service`, and so on |
+| Variable | Typed inputs — region, node size, CIDR ranges — rejected at plan time if the type's wrong, not mid-apply |
+| Output | Cluster names, subnet IDs, OIDC issuer URLs, identity client IDs — the interface other configs, or a human, can read |
+| State | Terraform's own record mapping what it declared to real Azure/Kubernetes object IDs. Anything created outside that record is invisible to it until imported (see Challenges) |
+| Dependency graph | Built entirely from HCL references. `depends_on` is used sparingly, only where a Helm values string is a hardcoded DNS name with no Terraform attribute behind it |
+| Idempotency | `apply` run twice with nothing changed reports `0 changed`. Demonstrated repeatedly here by a recurring, harmless AKS `upgrade_settings` drift that Azure keeps re-asserting |
+| Provider chaining | The `kubernetes`/`helm` blocks read credentials straight off `azurerm_kubernetes_cluster.mon.kube_config[0]` — no `az aks get-credentials`, no kubeconfig file needed for Terraform's own operations |
 
 ### Kubernetes provider and Helm provider — and where `kubectl` fits
 
-Three tools, three jobs, used together throughout this build:
-
-- **Terraform** owns the *lifecycle* — create, update, destroy — of both the Azure infrastructure and (via the `kubernetes`/`helm` providers) the Kubernetes objects and Helm releases. `terraform destroy` tears down everything it created.
-- **Helm** (invoked *through* Terraform's `helm` provider, not run standalone) packages and templates a chart's many Kubernetes objects into one deployable unit. A `helm_release` resource in Terraform corresponds to potentially dozens of underlying Kubernetes objects, tracked as a single Terraform resource.
-- **`kubectl`** was used throughout purely for inspection, debugging, and verification — reading pod logs, checking rendered ConfigMaps, port-forwarding to query an endpoint directly. It never created anything that Terraform is expected to own.
+Three tools, three jobs. Terraform owns the lifecycle — create, update, destroy — of both the Azure infrastructure and, through the `kubernetes`/`helm` providers, the Kubernetes objects and Helm releases. Helm, invoked through Terraform's provider rather than run standalone, packages a chart's many Kubernetes objects into one deployable unit — a `helm_release` in Terraform corresponds to potentially dozens of underlying objects, tracked as a single resource. `kubectl` shows up throughout purely for inspection and debugging: reading logs, checking a rendered ConfigMap, port-forwarding to hit an endpoint directly. It never created anything Terraform is expected to own.
 
 ### Prometheus High Availability
 
-Deployed as a **StatefulSet** (via `kube-prometheus-stack`, `replicas: 2`), not a Deployment. Two properties of a StatefulSet matter here that a Deployment does not give you:
+Deployed as a StatefulSet, via `kube-prometheus-stack` with `replicas: 2`, not a Deployment. Two things a StatefulSet gives you that a Deployment doesn't: stable pod identity (always `prometheus-...-0` and `-1`, never renamed on reschedule) and stable PVC association (pod `-0` always reattaches to its own volume, never the other one's).
 
-- **Stable pod identity** — always `prometheus-kube-prometheus-kube-prome-prometheus-0` and `-1`, never renamed on reschedule.
-- **Stable PVC association** — pod `-0` always reattaches to *its own* PersistentVolumeClaim, never the other replica's.
+Both matter because the two replicas are independent, uncoordinated Prometheus processes. They scrape the same targets on the same interval, but not in lockstep — each runs its own scrape timer, so samples land at slightly different timestamps. They don't hold identical data at any given instant, and they never will.
 
-Both properties matter because the two replicas are **independent, uncoordinated** Prometheus processes. They scrape the same targets on the same interval, but not in lockstep — each has its own scrape timer, so their samples land at slightly different timestamps. They do **not** contain identical data at every instant, and they never will.
-
-Each replica is tagged with an external label identifying itself:
+Each replica tags itself with an external label:
 
 ```yaml
 externalLabels:
@@ -328,18 +319,18 @@ confirmed in the running config as:
 ```yaml
 external_labels:
   prometheus: monitoring/kube-prometheus-kube-prome-prometheus
-  replica: prometheus-kube-prometheus-kube-prome-prometheus-0   # and -1 on the other pod
+  replica: prometheus-kube-prometheus-kube-prome-prometheus-0   # -1 on the other pod
 ```
 
-This label is the **only** thing that makes downstream deduplication possible — without it, Thanos Query would have no way to know that two slightly-different series represent the same logical metric from two replicas, and every graph would show doubled, overlapping lines.
+That label is the only thing making deduplication possible downstream. Without it, Thanos Query has no way to know two slightly different series are the same metric from two replicas, and every graph shows doubled, overlapping lines.
 
-**What HA fixes, and what it explicitly does not:** HA covers the window where one replica is down or being rescheduled — the moment monitoring itself is most likely to be needed. It does **not** protect against a wrong scrape config, a bad alert rule, or a wrong PromQL query — both replicas run the identical (mis)configuration, so both are wrong in exactly the same way.
+What HA actually buys you: coverage for the window where one replica is down or being rescheduled — the moment monitoring is most likely to be needed. What it doesn't buy you: protection from a wrong scrape config, a bad alert rule, or a broken query. Both replicas run the identical configuration, so if it's wrong, it's wrong on both, identically.
 
-Local retention is deliberately short (`retention: "6h"`) — Prometheus is a recent-data buffer; Thanos owns everything older.
+Local retention is deliberately short — `retention: "6h"`. Prometheus is a recent-data buffer here; Thanos owns everything older.
 
 ### Grafana
 
-Grafana's Thanos datasource points at **Thanos Query**, never at either Prometheus replica directly:
+The Thanos datasource points at Thanos Query, never at either Prometheus replica directly:
 
 ```yaml
 - name: Thanos
@@ -351,50 +342,50 @@ Grafana's Thanos datasource points at **Thanos Query**, never at either Promethe
   editable: false
 ```
 
-Querying a Prometheus replica directly would silently return only that replica's view — no error, just a dashboard that's quietly missing data during that replica's downtime. Thanos Query fans out to both replicas' StoreAPI, deduplicates on the `replica` label, and returns one merged result — Grafana never needs to know HA exists.
+Querying a replica directly would silently show only that replica's view — no error, just a dashboard quietly missing data during that replica's downtime. Thanos Query fans out to both, deduplicates on the `replica` label, and returns one merged answer. Grafana never has to know HA exists.
 
-**`editable: false`** means a Grafana admin cannot change this datasource's connection details through the UI. Any drift must go through Terraform, so the running configuration and the declared configuration can never silently diverge.
+`editable: false` means an admin can't change the datasource's connection details through the UI — any real change goes through Terraform, so the declared and running configurations can't silently drift apart.
 
-**Persistence is disabled** (`persistence.enabled = false`). This is a deliberate, stated trade-off, not an oversight: any dashboard built through the Grafana UI lives only in that pod's ephemeral storage and is **lost** the moment the pod is rescheduled. The datasource survives regardless, because it's provisioned via a ConfigMap the chart remounts on every pod start — the distinction is *provisioned configuration* (survives, because it's re-applied from code) versus *UI-created state* (does not, because nothing re-applies it).
+Persistence is disabled (`persistence.enabled = false`), and that's a stated trade-off, not an oversight. Any dashboard built through the UI lives only in that pod's ephemeral storage and is gone the moment the pod reschedules. The datasource survives regardless, because it's provisioned via a ConfigMap the chart remounts on every start — provisioned config comes back on its own; UI-created state doesn't, because nothing re-applies it.
 
-**Grafana's own Service is `type: LoadBalancer` with no internal annotation** — it's the one component in this build deliberately given a **public** IP, because a human, outside both clusters, needs to reach its UI. This has a real, ongoing cost and exposure implication — see [Cost and Cleanup](#cost-and-cleanup).
+Grafana's own Service is `type: LoadBalancer` with no internal annotation — the one component here deliberately given a public IP, because a person outside both clusters needs to reach the UI directly. That has a real, ongoing cost and exposure story — see [Cost and Cleanup](#cost-and-cleanup).
 
-All three datasources — **Thanos**, **Loki**, and **Tempo** — are provisioned and confirmed working directly in the Grafana UI, not just via API calls. The full correlation this platform was built to enable was verified end-to-end through Explore: a trace opened by ID (`handle-request`, `demo-app`, `230.64ms`) rendered correctly with its `Service`/`Duration`/`Kind` metadata, and a second, freshly-generated request pair (`"handled request in 0.160s"` in Loki, matched against its corresponding span in Tempo's Search tab) confirmed the same correlation works on live, newly-created data — not just the original Part 12 trace.
+All three datasources — Thanos, Loki, Tempo — are provisioned and were confirmed working directly in the UI, not just via API calls. The correlation this whole platform exists to enable was checked end to end through Explore: a trace opened by ID (`handle-request`, `demo-app`, `230.64ms`) rendered with its Service/Duration/Kind metadata, and a second, freshly generated request (`"handled request in 0.160s"` in Loki, matched against its span in Tempo's Search tab) confirmed the same correlation on live data, not just the one original trace.
 
 ### Azure Blob Storage
 
-One storage account (`stobsday2<random>`), four containers, each written by exactly one workload identity:
+One storage account, four containers, each written by exactly one workload identity:
 
 | Container | Written by | Contents |
 |---|---|---|
-| `thanos` | Both Prometheus sidecars | Sealed TSDB blocks, uploaded roughly every 2 hours. **Both replicas upload independently** — the `thanos` container holds two overlapping copies of the same underlying data until a Thanos Compactor (not deployed in this build) would deduplicate it at rest |
+| `thanos` | Both Prometheus sidecars | Sealed TSDB blocks, uploaded roughly every 2 hours. Both replicas upload independently, so this container holds two overlapping copies of the same data until a Compactor (not deployed here) would merge them at rest |
 | `loki-chunks` | Loki | Compressed log chunk data |
 | `loki-ruler` | Loki | Alerting-rule evaluation state |
 | `tempo-traces` | Tempo | Trace span data |
 
-`is_hns_enabled = false` on the storage account is deliberate — enabling hierarchical namespace (Data Lake Gen2) changes how blobs are addressed and breaks the S3-compatible client libraries Thanos, Loki, and Tempo all use.
+`is_hns_enabled = false` is deliberate — hierarchical namespace changes how blobs are addressed and breaks the S3-compatible client libraries all three tools rely on.
 
 ### Azure Workload Identity
 
-Every one of Thanos, Loki, and Tempo authenticates to Blob Storage with **no password, key, or secret anywhere** — not in a Kubernetes Secret, not in Terraform state as a credential (only as an RBAC scope). The mechanism:
+Thanos, Loki, and Tempo all authenticate to Blob Storage with no password, key, or secret anywhere — not in a Kubernetes Secret, not in Terraform state as a credential. The mechanism:
 
 ```
 Kubernetes ServiceAccount (namespace/name — e.g. monitoring/thanos)
         ↓  issues a signed OIDC token
-Azure trusts this cluster's OIDC issuer, for this EXACT ServiceAccount
-        ↓  (this trust relationship IS the Federated Identity Credential)
+Azure trusts this cluster's OIDC issuer, for this exact ServiceAccount
+        ↓  (that trust relationship is the Federated Identity Credential)
 Azure exchanges the token for a short-lived Azure AD access token
         ↓
-Token is scoped to whatever Azure RBAC role the target Managed Identity holds
+Scoped to whatever Azure RBAC role the target Managed Identity holds
         ↓
-Access to Azure Blob Storage — token auto-rotates, ~1 hour lifetime
+Access to Blob Storage — the token auto-rotates, roughly an hour's lifetime
 ```
 
-This is preferable to a storage account key or client secret for three concrete reasons: the token expires and auto-rotates with no manual rotation step; it is scoped to exactly what the RBAC assignment grants (see below), never the whole account; and there is nothing long-lived to leak from a compromised pod.
+Preferable to a storage account key for three reasons: nothing long-lived exists to leak, the token auto-rotates with no manual step, and it's scoped to exactly what the RBAC assignment grants rather than the whole account.
 
 ### Federated Identity Credential
 
-The trust relationship's `subject` field must match the consuming ServiceAccount **exactly** — namespace and name, character for character:
+The `subject` field has to match the consuming ServiceAccount exactly — namespace and name, character for character:
 
 ```
 system:serviceaccount:monitoring:thanos
@@ -402,11 +393,11 @@ system:serviceaccount:monitoring:loki
 system:serviceaccount:monitoring:tempo
 ```
 
-**The failure mode when this doesn't match is the single most important lesson of this workshop.** A mismatched or missing subject does not produce a Terraform error, a Kubernetes scheduling failure, or an authentication error at the point of mismatch. The pod starts. It reports `Running`, `Ready`. The application's own storage client, at the moment it first tries to use credentials that were never actually injected, either falls back to no identity at all (producing a plain `403 Forbidden` from Azure, since the node's own identity has no RBAC on the storage account) or, in one case in this build, reported the misleading message `"no supported bucket was configured, uploads will be disabled"` — a message that reads like a configuration-content problem and is actually an identity-wiring problem three layers upstream. This exact failure occurred and was fixed during this build (see [Challenges](#challenges-and-troubleshooting)).
+This is the single most important lesson in the whole build. A mismatched or missing subject produces no Terraform error, no scheduling failure, nothing at the point of mismatch. The pod starts. It reports `Running`, `Ready`. Only later, when the application's storage client actually tries to use credentials that were never injected, does anything surface — either a plain `403` (falling back to the node's own identity, which has no storage RBAC), or, in one real case here, the message `"no supported bucket was configured, uploads will be disabled"` — which reads like a config-content problem and is actually an identity-wiring problem three layers upstream. This happened and was fixed during this build; see [Challenges](#challenges-and-troubleshooting).
 
 ### Azure RBAC
 
-Every identity is granted **`Storage Blob Data Contributor`**, scoped to a **container**, never to the storage account:
+Every identity gets `Storage Blob Data Contributor`, scoped to a container, never the storage account:
 
 ```hcl
 resource "azurerm_role_assignment" "thanos_storage" {
@@ -416,9 +407,9 @@ resource "azurerm_role_assignment" "thanos_storage" {
 }
 ```
 
-`Storage Blob Data Contributor` grants read, write, and delete on blob data within its scope — it does not grant management-plane rights (creating or deleting containers, changing account settings). Because the scope is a single container's resource ID, the Thanos identity genuinely cannot reach `loki-chunks`, `loki-ruler`, or `tempo-traces` — Azure enforces this at the API level, not by convention. **Loki has two separate role assignments** (one for `loki-chunks`, one for `loki-ruler`) because a single `azurerm_role_assignment` can only target one scope; granting access to two containers is mechanically two assignments, not a list.
+That role grants read, write, and delete on blob data within its scope — no management-plane rights like creating or deleting containers. Because the scope is a single container's resource ID, the Thanos identity genuinely can't reach `loki-chunks`, `loki-ruler`, or `tempo-traces` — Azure enforces that at the API level. Loki has two separate role assignments, for `loki-chunks` and `loki-ruler`, because a single `azurerm_role_assignment` can only target one scope; granting access to two containers is mechanically two assignments.
 
-A separate, distinct RBAC grant exists on the **AKS cluster's own control-plane identity** (not a workload identity) — `Network Contributor` on `vnet-mon`. This was discovered mid-build: AKS clusters using a custom, pre-existing VNet ("bring your own VNet") need their control-plane identity to have write access on that VNet to provision Kubernetes-managed resources like internal load balancers. It is unrelated to the Thanos/Loki/Tempo identity chain above.
+A separate RBAC grant exists on the AKS cluster's own control-plane identity — `Network Contributor` on `vnet-mon`, unrelated to the three workload identities above. This surfaced mid-build: an AKS cluster using a custom, pre-existing VNet needs its control-plane identity to have write access on that VNet to provision things like internal load balancers.
 
 ### Thanos
 
@@ -426,23 +417,23 @@ A separate, distinct RBAC grant exists on the **AKS cluster's own control-plane 
 Prometheus (×2, independent)
     ↓
 Thanos Sidecar (one per Prometheus pod, shares the pod's local disk)
-    ↓  uploads sealed blocks every ~2h, via the federated identity above
-Azure Blob Storage (container: thanos)
+    ↓  uploads sealed blocks every ~2h, via the identity above
+Blob Storage (container: thanos)
     ↓
-Thanos Query (plain Kubernetes Deployment — see note below)
+Thanos Query (a plain Deployment — see note)
     ↓  --query.replica-label=replica, fans out via
     ↓  --store=dns+prometheus-operated.monitoring.svc.cluster.local:10901
 Grafana
 ```
 
 > [!NOTE]
-> **Thanos Query is a plain `kubernetes_deployment`/`kubernetes_service` pair, not a Helm chart.** It was initially deployed via the Bitnami `thanos` chart; that chart's default image, `docker.io/bitnami/thanos`, returned zero tags mid-build because Bitnami removed its free-tier Docker Hub images in August 2025. Rather than pin to the frozen `bitnamilegacy` archive, the chart was dropped entirely in favor of a plain Deployment running `quay.io/thanos/thanos:v0.36.1` — the same actively-maintained image the sidecar itself uses.
+> Thanos Query is a plain `kubernetes_deployment`/`kubernetes_service` pair, not a Helm chart. It started life on the Bitnami `thanos` chart, whose default image returned zero tags mid-build — Bitnami pulled its free-tier Docker Hub images in August 2025. Rather than pin to the frozen `bitnamilegacy` archive, the chart was dropped for a plain Deployment running `quay.io/thanos/thanos:v0.36.1`, the same actively maintained image the sidecar itself uses.
 
-Storegateway and Compactor are **not deployed** in this build (disabled, to keep the resource footprint inside a 2-node budget) — long-term storage works (data lands in Blob, Thanos Query can read it), but querying deep historical data is unoptimized without a Store Gateway, and blocks are not deduplicated at rest without a Compactor.
+Store Gateway and Compactor aren't deployed, to keep the footprint inside a 2-node budget. Long-term storage works — data lands in Blob, Thanos Query can read it — but historical queries are unoptimized without a Store Gateway, and blocks aren't deduplicated at rest without a Compactor.
 
 ### Alloy
 
-Deployed to `aks-app`, as a DaemonSet (the chart's default `controller.type`) — one pod per node, since log tailing and container discovery are inherently node-local. Three independent pipelines, written in Alloy's own configuration syntax (which uses `//` for comments, not `#` — see [Challenges](#challenges-and-troubleshooting)):
+Deployed to `aks-app` as a DaemonSet — the chart's own default — one pod per node, since log tailing and container discovery are inherently local to a node. Three pipelines, written in Alloy's own configuration syntax, which uses `//` for comments, not `#` (see Challenges):
 
 ```river
 prometheus.scrape "node_metrics" { ... }
@@ -462,21 +453,21 @@ otelcol.exporter.otlp "to_tempo" {
 }
 ```
 
-All three destinations are **private internal-LoadBalancer IPs on `vnet-mon`'s node subnet**, not Kubernetes DNS names — required because Alloy runs in a different cluster than the systems it sends data to (see [Network separation](#network-separation-and-connectivity)). This required adding an internal LoadBalancer for Prometheus specifically for this purpose — nothing before Alloy existed had needed to reach Prometheus from outside `aks-mon`.
+All three destinations are private internal-LoadBalancer IPs on `vnet-mon`'s node subnet, not DNS names, because Alloy runs in a different cluster than everything it's sending data to. This is also why Prometheus needed its own internal load balancer for the first time — nothing before Alloy had ever needed to reach it from outside `aks-mon`.
 
 | Destination | Private IP | Exposed via |
 |---|---|---|
-| Loki push API | `10.20.0.6:3100` | A standalone `kubernetes_service` — Loki's own `singleBinary.service.type` is a dead key in the chart (see Challenges), so the chart's Service could not be made internal directly |
-| Tempo OTLP | `10.20.0.7:4317` | Chart-native `service.type` + `azure-load-balancer-internal` annotation (this chart *does* honor it) |
-| Prometheus remote_write | `10.20.0.8:9090` | Chart-native `prometheus.service.type` + annotation (also honored) |
+| Loki push API | `10.20.0.6:3100` | A standalone `kubernetes_service` — Loki's own `singleBinary.service.type` is a dead key in the chart (see Challenges), so its built-in Service can't be made internal directly |
+| Tempo OTLP | `10.20.0.7:4317` | Chart-native `service.type` plus the internal annotation — this chart does honor it |
+| Prometheus remote_write | `10.20.0.8:9090` | Same, chart-native and honored |
 
 ### Demo application
 
-Online Boutique (the workshop's original reference application) was not deployed — its eleven microservices want 4–6 GiB, which does not fit the node budget alongside Alloy's own DaemonSet footprint. In its place: a minimal, fully self-contained Flask application, delivered via a `kubernetes_config_map` mounted into a stock `python:3.12-slim` container (dependencies installed at container start — a stated trade-off for avoiding a container registry/build step, not a production pattern).
+Online Boutique, the original reference app, wasn't deployed — its eleven microservices want 4–6 GiB, which doesn't fit the node budget alongside Alloy's own DaemonSet. In its place: a small, self-contained Flask app, delivered as a `kubernetes_config_map` mounted into a stock `python:3.12-slim` container, with dependencies installed at container start. That's a stated trade-off for avoiding a registry and a build step, not something you'd ship for real.
 
-The app exposes `/` (creates one OpenTelemetry span, `handle-request`, with a random 50–300ms delay recorded as a span attribute, and logs `"handled request in Xs"` to stdout) and `/healthz`. This is intentionally the smallest possible thing that exercises the full pipeline — one request, one span, one log line, fully correlatable.
+It exposes `/`, which opens one OpenTelemetry span (`handle-request`) with a random 50–300ms delay recorded as an attribute, and logs `"handled request in Xs"` to stdout — plus `/healthz`. Deliberately the smallest thing that exercises the whole pipeline: one request, one span, one log line, fully correlatable.
 
-**Confirmed end-to-end, with real data:** five requests to `/` produced five matching spans in Tempo and five matching log lines in Loki, timestamps and durations aligned. Trace `1745925fd4b71ca8a3bdf47525cf69f5` (230ms) was cross-referenced directly against the Loki log line `"handled request in 0.230s"` for the same pod at the same second. The metrics path was separately confirmed via `alloy_build_info`, a self-metric Alloy exposes, queryable through Thanos Query — proving the full chain: Alloy → Prometheus remote_write → Thanos sidecar → Blob Storage → Thanos Query.
+Confirmed end to end, with real data: five requests to `/` produced five matching spans in Tempo and five matching log lines in Loki, timestamps and durations aligned. Trace `1745925fd4b71ca8a3bdf47525cf69f5` (230ms) was cross-referenced directly against the Loki line `"handled request in 0.230s"` for the same pod at the same second. The metrics path was separately confirmed through `alloy_build_info`, a self-metric Alloy exposes, queryable through Thanos Query — proving the full chain from Alloy's remote_write through Prometheus, the sidecar, Blob Storage, and back out through Thanos Query.
 
 ---
 
@@ -484,59 +475,49 @@ The app exposes `/` (creates one OpenTelemetry span, `handle-request`, with a ra
 
 | Layer | How it was actually checked |
 |---|---|
-| Terraform | `terraform plan` read before every apply; drift confirmed harmless (`upgrade_settings`) via repeated `0 changed` after re-apply |
-| Kubernetes | `kubectl get pods -n monitoring`, `kubectl get pvc -n monitoring`, `kubectl get svc -n monitoring` on both cluster contexts |
-| Prometheus | `curl http://localhost:9090/-/ready`; **external labels validated by reading the rendered config directly** (`/etc/prometheus/config_out/prometheus.env.yaml`), not by querying `/api/v1/query` — see [Challenges](#challenges-and-troubleshooting) for why the obvious check is the wrong one |
-| Grafana | `Data Sources → Save & Test` on each provisioned datasource |
-| Thanos | `curl http://localhost:9091/api/v1/stores` (both sidecars visible, each with a distinct `replica` label); sidecar logs checked directly for `"upload new block"` confirming real writes, not just reachability |
+| Terraform | `terraform plan` before every apply; drift confirmed harmless via repeated `0 changed` after re-applying |
+| Kubernetes | `kubectl get pods/pvc/svc -n monitoring` on both cluster contexts |
+| Prometheus | `curl http://localhost:9090/-/ready`; external labels checked by reading the rendered config directly (`/etc/prometheus/config_out/prometheus.env.yaml`), not by querying `/api/v1/query` — see Challenges for why that's the wrong check |
+| Grafana | Save & Test on each provisioned datasource |
+| Thanos | `curl http://localhost:9091/api/v1/stores` — both sidecars visible, each with a distinct `replica` label; sidecar logs checked directly for `"upload new block"` to confirm real writes, not just reachability |
 | Azure Blob Storage | `az storage container list --account-name <name> --auth-mode login` |
-| Workload Identity | `kubectl get pod ... -o yaml \| grep azure.workload.identity/use` on the actual running pod, cross-checked against sidecar logs for a successful (not just attempted) upload |
-| Integration (end-to-end) | Real HTTP traffic to the demo app; the resulting trace queried directly from Tempo (`/api/search`) and the resulting log line queried directly from Loki (`/loki/api/v1/query_range`), matched by timestamp |
+| Workload Identity | `kubectl get pod ... -o yaml \| grep azure.workload.identity/use` on the actual pod, cross-checked against sidecar logs for a successful upload, not just an attempted one |
+| Integration | Real HTTP traffic to the demo app, the resulting trace pulled directly from Tempo and the resulting log line pulled directly from Loki, matched by timestamp |
 
-There is no automated test suite exercising any of this yet — see [Testing — Future Work](#testing--future-work).
+No automated test suite exercises any of this yet — see [Testing](#testing--future-work).
 
 ---
 
 ## PromQL Reference
 
-All queries run against the **Thanos** datasource (deduplicated), not against either Prometheus replica directly.
+All queries run against the Thanos datasource — deduplicated, not either Prometheus replica directly.
 
-| Query | Measures | Healthy result | Why it's useful |
+| Query | Measures | Healthy result | Why it matters |
 |---|---|---|---|
-| `up` | Every scrape target's last-scrape success (1) or failure (0) | Every series `== 1` | The single most useful metric in Prometheus — `1` means the scrape succeeded, nothing more |
-| `count(up)` | Total number of scrape targets | A stable, expected number | A sudden drop means targets disappeared from discovery, not that they went down |
-| `up == 0` | Targets currently failing to scrape | Empty result | The direct "what's broken right now" query |
-| `count by (job) (up)` | Target count grouped by job | Matches your expected topology per job | Localizes a target-count drop to one job rather than the whole cluster |
-| `prometheus_build_info` | Prometheus's own version/build metadata | One series per Prometheus process | Confirms which binary version is actually running |
-| `count(prometheus_build_info)` | Number of distinct Prometheus processes reporting | `2` in this build | A direct, load-bearing check that both HA replicas are alive and self-reporting |
-| `prometheus_tsdb_head_series` | Number of active time series in the in-memory head block | A stable, bounded number | Runaway growth (cardinality explosion) shows here first |
-| `rate(prometheus_tsdb_head_samples_appended_total[5m])` | Samples ingested per second | Roughly constant under steady load | The direct measure of ingestion rate/throughput |
-| `prometheus_config_last_reload_successful` | Whether the last config reload succeeded | `1` | `0` means the running config is stale relative to what's on disk — directly relevant given the config-reloader issue in this build (see Challenges) |
-| `alloy_build_info` | Alloy's own self-reported build metadata | Present, with correct version | The actual end-to-end proof used in this build that Alloy → Prometheus remote_write → Thanos → Blob → Thanos Query works, since this metric can only exist if every hop succeeded |
+| `up` | Last-scrape success/failure per target | Every series `== 1` | The single most load-bearing metric in Prometheus |
+| `count(up)` | Total scrape targets | A stable, expected number | A sudden drop means targets disappeared from discovery |
+| `up == 0` | Targets currently failing | Empty | The direct "what's broken right now" query |
+| `count by (job) (up)` | Target count per job | Matches your expected topology | Localizes a drop to one job instead of the whole cluster |
+| `prometheus_build_info` | Prometheus's own build metadata | One series per process | Confirms which binary is actually running |
+| `count(prometheus_build_info)` | Distinct Prometheus processes | `2` in this build | Direct confirmation both HA replicas are alive |
+| `prometheus_tsdb_head_series` | Active series in the head block | Stable, bounded | Runaway growth shows up here first |
+| `rate(prometheus_tsdb_head_samples_appended_total[5m])` | Samples ingested per second | Roughly constant | The direct ingestion-rate measure |
+| `prometheus_config_last_reload_successful` | Last reload's success | `1` | `0` means the running config is stale relative to disk |
+| `alloy_build_info` | Alloy's own build metadata | Present, correct version | The actual end-to-end proof used here that Alloy → Prometheus → Thanos → Blob → Thanos Query works |
 
 ---
 
 ## Command Reference
 
 ```bash
-# Getting kubeconfig contexts set up (once, after the first apply —
-# see the note under Deployment for why this is needed at all)
-az aks get-credentials -g rg-obs-day2 -n aks-mon --context aks-mon
-az aks get-credentials -g rg-obs-day2 -n aks-app --context aks-app
-
-# Reaching Grafana
-terraform output -raw grafana_admin_password        # login is "admin" / this
-kubectl get svc grafana -n monitoring --context aks-mon   # EXTERNAL-IP, port 80
-
 # Kubernetes inspection
 kubectl get pods -n monitoring --context aks-mon
 kubectl get pvc -n monitoring --context aks-mon
-kubectl get prometheus -n monitoring --context aks-mon
 kubectl get pod -n monitoring <pod> -o jsonpath='{.spec.containers[*].name}'
 kubectl get pod -n monitoring <pod> -o yaml | grep azure.workload.identity/use
 kubectl logs -n monitoring <pod> -c thanos-sidecar --tail=50
 
-# Reaching a service directly for verification
+# Reaching a service directly
 kubectl port-forward -n monitoring <pod> 9090:9090
 curl http://localhost:9090/-/ready
 curl -s http://localhost:9090/api/v1/status/config
@@ -546,19 +527,17 @@ terraform init
 terraform plan
 terraform apply
 terraform state list
-terraform import <resource_address> <azure_resource_id>   # used once, to reconcile
-                                                            # a manually-created role
-                                                            # assignment back into state
+terraform import <resource_address> <azure_resource_id>
 terraform destroy
 
 # Azure
-az aks start  -g rg-obs-day2 -n aks-mon
-az aks stop   -g rg-obs-day2 -n aks-mon --no-wait
+az aks start -g rg-obs-day2 -n aks-mon
+az aks stop  -g rg-obs-day2 -n aks-mon --no-wait
 az storage container list --account-name <name> --auth-mode login -o table
 az network lb list -g MC_rg-obs-day2_aks-mon_southindia --query "[].name" -o table
 
-# Helm (used for CHART INSPECTION during development — the releases
-# themselves are created via Terraform's helm provider, not `helm install`)
+# Helm — used to inspect chart behavior during development;
+# the releases themselves come from Terraform's helm provider
 helm repo add grafana https://grafana.github.io/helm-charts
 helm show values grafana/loki | grep -A10 "^serviceAccount:"
 helm template grafana/loki --set singleBinary.service.type=LoadBalancer
@@ -568,9 +547,7 @@ helm template grafana/loki --set singleBinary.service.type=LoadBalancer
 
 ## Challenges and Troubleshooting
 
-These are the real issues hit during this build, in the order they mattered — not a sanitized list.
-
-### 1. AKS availability zone rejection
+### 1. AKS rejected the availability zone
 
 Setting `default_node_pool.zones = ["1", "2"]` on both clusters produced:
 
@@ -579,255 +556,245 @@ AvailabilityZoneNotSupported: The zone(s) '2' for resource 'system' is not
 supported. The supported zones for location 'southindia' are ''
 ```
 
-This is a **region capability** issue, not a quota issue — `southindia` simply does not support availability-zone-pinned node pools for this configuration, regardless of how much quota the subscription has. The fix was removing the `zones` argument entirely. This is not a universally correct answer — a region that *does* support AZs (e.g. many other Azure regions) would make zone-pinning both valid and a genuine reliability improvement; it was dropped here specifically because `southindia` doesn't support it, not because zone-pinning is a bad idea in general.
+That's a region-capability issue, not quota — `southindia` doesn't support AZ-pinned node pools for this config, full stop. The fix was dropping `zones` entirely. This isn't a universal answer; a region that does support AZs would make zone-pinning both valid and a real reliability win. It was dropped here because this specific region doesn't support it, not because the idea itself is wrong.
 
-### 2. A four-vCPU wall, and a family-specific quota gap
+### 2. A four-vCPU wall, and a quota gap specific to one VM family
 
-Separately from the AZ issue: the subscription started on Azure's **Free Trial** tier, which carries a **hard 4 vCPU cap across every VM family combined, per region** — not the 10–20 vCPU default most people expect from a standard subscription. Two `D4s_v5` nodes per cluster (the original plan) needed 16 vCPUs total; even the minimum viable two-cluster shape (4× `D2s_v5`, 8 vCPU) exceeded the cap.
+Separately: the subscription started on Azure's Free Trial tier, which caps total vCPUs across every VM family combined, per region, at 4 — well below the 10–20 most people expect from a normal subscription. The original two `D4s_v5` nodes per cluster needed 16 vCPUs; even the minimum viable shape blew past 8.
 
-Upgrading to Pay-As-You-Go raised the regional default to 10 vCPU — but a **second**, more specific gap then appeared: Azure quota is enforced *per VM family* as well as per region, and the `Standard DSv5 Family` quota (which `D2s_v5`/`D4s_v5` both draw from) was independently capped at **0**, even though the *regional total* showed headroom. A family-specific quota increase request (approved, raising `Standard Ddsv6 Family` to 32) is what actually unblocked the build — the final node SKU, `Standard_D2ds_v6`, was chosen because it was the first family with real, usable quota, not because it was the original plan.
+Upgrading to Pay-As-You-Go raised the regional default to 10. A second, more specific gap then showed up: Azure enforces quota per VM family as well as per region, and the `DSv5` family — which `D2s_v5`/`D4s_v5` both draw from — sat independently capped at 0, even with regional headroom. A family-specific quota increase, approved for `Ddsv6`, is what actually unblocked things. `Standard_D2ds_v6` is the final node size because it was the first family with usable quota, not because it was the plan.
 
-**Lesson:** "region accepts the subscription," "the SKU exists in this region," "family-level quota," and "region-level quota" are four independent gates. All four have to be checked — checking any one and assuming the others follow is how this cost real time twice.
+Region acceptance, SKU availability, family-level quota, and region-level quota are four independent gates. Checking one and assuming the rest follow cost real time here, twice.
 
-### 3. Prometheus `external_labels` — the wrong validation method
+### 3. Validating Prometheus's external labels the wrong way
 
-After adding the `replica` external label, the obvious check —
+The obvious check —
 
 ```bash
 curl -s 'http://localhost:9090/api/v1/query?query=up' | python3 -m json.tool | grep replica
 ```
 
-— returned nothing, and looked like the label wasn't being applied. **This was never going to work, correct config or not.** Prometheus does not attach `external_labels` to results from its own local `/api/v1/query` endpoint; that mechanism only applies at federation, remote_write, and the status page. The correct check is reading the *rendered configuration directly off the running pod*:
+— returned nothing, and looked like the label wasn't applying. It was never going to show up there. Prometheus doesn't attach `external_labels` to results from its own local `/api/v1/query`; that only happens at federation, remote_write, and the status page. The real check is reading the rendered config off the pod directly:
 
 ```bash
 kubectl exec <pod> -c prometheus -- cat /etc/prometheus/config_out/prometheus.env.yaml | grep -A3 external_labels
 ```
 
-which correctly showed `replica: prometheus-kube-prometheus-kube-prome-prometheus-0` (and `-1` on the other pod) from the start. The label had been correct the whole time; the validation method was wrong. Later, once Thanos Query was running, the label became genuinely visible in query *behavior* — not as a returned field, but as the mechanism producing correctly-deduplicated results (`/api/v1/stores` showing two distinct store entries, each with its own `replica` value).
+which correctly showed `replica: prometheus-...-0` (and `-1`) from the start. The label was right the whole time; the check was wrong.
 
-### 4. Config-reloader: real warnings, and a diagnosis that stayed genuinely open
+### 4. config-reloader warnings that never got a fully confirmed root cause
 
-While chasing the above, the config-reloader sidecar logged repeated, real warnings:
+While chasing the above, config-reloader logged real, repeated warnings:
 
 ```
 trigger reload: received non-200 response: 500 Internal Server Error;
 have you set `--web.enable-lifecycle` Prometheus flag?
 ```
 
-config-reloader's job is calling Prometheus's `/-/reload` HTTP endpoint whenever its watched config file changes, so Prometheus picks up the new config without a pod restart. That endpoint is disabled by default; `--web.enable-lifecycle` turns it on — and it was confirmed, directly on the running pod's process arguments, to **already be present**, added automatically by the Prometheus Operator. So the generic hint in the log message wasn't the actual cause here. The reload did eventually succeed (`msg="Reload triggered"` appeared in the logs once the external-labels fix landed), but the precise mechanism behind the intervening failures was not conclusively pinned down during this build — worth stating plainly rather than presenting a guess as a confirmed root cause.
+That flag was confirmed present on the running process already, added automatically by the Prometheus Operator, so the generic hint wasn't the actual cause. The reload did eventually succeed. What exactly caused the intervening failures was never fully pinned down — worth saying plainly rather than presenting a guess as a finding.
 
-### 5. Thanos sidecar: present from Part 6, absent at one specific validation point, then broken and fixed
+### 5. The identity-labeling bug, three times, in three places
 
-Early in Prometheus HA validation (before Thanos was added), each pod correctly showed only two containers — `prometheus` and `config-reloader` — with no Thanos sidecar, because Thanos hadn't been wired in yet at that point in the build. Once added, a real, separate bug appeared: the sidecar logged `"no supported bucket was configured, uploads will be disabled"` despite the storage Secret being correctly populated. The actual cause, found by reading the Prometheus Operator chart's own template source: `prometheusSpec.serviceAccountName` — the value used to attach the workload-identity-bound ServiceAccount — **is not a field the chart's template reads at all**. The correct fields are `prometheus.serviceAccount.{create,name}` (a sibling key, not nested under `prometheusSpec`) plus `prometheusSpec.podMetadata.labels` for the pod-level `azure.workload.identity/use` label the identity webhook actually selects on. Fixing both, and confirming via `kubectl get pod -o yaml` that the label landed on the **pod** (not just the ServiceAccount object), resolved it — confirmed by real `"upload new block"` log lines appearing for both replicas.
+The Azure workload-identity webhook mutates based on the pod's own labels, never the ServiceAccount's. A `serviceAccount.labels` field existing in a chart's values — even sitting right next to `annotations` — isn't proof it reaches the pod. This bit three separate components independently, each requiring a read of that chart's actual template source to find the real field:
 
-### 6. The same identity-labeling bug, twice more, in two different places
+- Prometheus Operator: `prometheusSpec.podMetadata.labels` (and `serviceAccountName` inside `prometheusSpec` is a dead field entirely — the real ServiceAccount comes from a sibling `serviceAccount.{create,name}` block)
+- Loki: `singleBinary.podLabels`
+- Tempo: a bare top-level `podLabels`, no nesting at all
 
-The exact same class of bug — a workload-identity label placed on the Kubernetes **ServiceAccount** object instead of the **pod** — recurred independently in both the Loki and Tempo charts, each requiring reading that specific chart's template source to find the real field:
+Three charts, three different field names, no shared convention.
 
-- Loki: `singleBinary.podLabels` (not `serviceAccount.labels`)
-- Tempo: a bare top-level `podLabels` key (not nested under `serviceAccount` at all)
+### 6. Loki: a dead `service.type` key
 
-**The durable lesson:** the Azure workload-identity admission webhook mutates based on the **pod's own labels**, never the ServiceAccount's. A `serviceAccount.labels` field existing in a chart's values schema, even sitting directly next to `annotations`, is not proof it reaches the pod — every chart in this build placed its real pod-label field in a different location, with no shared convention, and the only reliable way to know was reading the template source directly.
+`singleBinary.service.type = LoadBalancer` produced no error and no internal LB, because Loki's `templates/single-binary/service.yaml` hardcodes `type: ClusterIP` and never reads that field — confirmed by reading the template. Fixed with a standalone `kubernetes_service`, targeting the same pods by label, alongside the chart's own ClusterIP Service rather than replacing it.
 
-### 7. Loki: a dead `service.type` key
+### 7. Loki: ring quorum failure with one instance
 
-Setting `singleBinary.service.type = LoadBalancer` in Loki's values produced no error and no internal LB — because the chart's own `templates/single-binary/service.yaml` hardcodes `type: ClusterIP` and never reads `.Values.singleBinary.service.type` at all (confirmed by reading the template). The fix was a standalone `kubernetes_service` resource, targeting Loki's real pod-selector labels directly, alongside (not replacing) the chart's own ClusterIP Service.
-
-### 8. Loki: ring quorum failure in single-instance mode
-
-Once Loki was running, `/ready` succeeded but `/loki/api/v1/labels` failed with:
+`/ready` succeeded, `/loki/api/v1/labels` failed with:
 
 ```
 rpc error: code = Code(500) desc = too many unhealthy instances in the ring
 ```
 
-Confirmed directly by reading the pod's rendered config: `common.replication_factor: 3` — the chart's generic multi-instance default — was still active despite `deploymentMode: SingleBinary` and one running replica. With a replication factor of 3 and only one real ring member, quorum math treats two non-existent replicas as "unhealthy," and every read fails. The fix: `loki.commonConfig.replication_factor = 1`, confirmed against the chart's own bundled single-binary example values before applying.
+`common.replication_factor` was still `3`, the chart's multi-instance default, despite `SingleBinary` mode and one real replica. Quorum math expected two replicas that don't exist and marked them unhealthy. Fixed with `replication_factor = 1`, confirmed against the chart's own single-binary example before applying.
 
-### 9. Prometheus's remote_write receiver was off by default
+### 8. Prometheus's remote_write receiver was off
 
-Alloy's `remote_write` attempts to Prometheus initially failed with a `404` — the `/api/v1/write` endpoint didn't exist at all until `prometheusSpec.enableRemoteWriteReceiver = true` was added. After the fix, the same unauthenticated probe request returned `415 Unsupported Media Type` instead — the correct, informative result, since remote_write requires a specific protobuf content type the probe never sent. The status code changing from `404` to `415` was the actual proof the fix worked, not the probe itself succeeding.
+Alloy's writes failed with a `404` until `prometheusSpec.enableRemoteWriteReceiver = true` was added. After the fix, the same probe returned `415 Unsupported Media Type` — the correct result, since remote_write needs a specific protobuf content type the probe never sent. The status changing from `404` to `415` was the actual proof, not the probe succeeding outright.
 
-### 10. Cross-cluster DNS: the recurring root cause across the whole Alloy build
+### 9. Cross-cluster DNS, and a config that silently never reloaded
 
-Alloy's config initially pointed at `kube-prometheus-kube-prome-prometheus.monitoring.svc.cluster.local` — which resolves only inside `aks-mon`, and Alloy runs in `aks-app`. The failure (`dial tcp: lookup ... no such host`, resolved against `aks-app`'s **own** internal DNS server) persisted for some time after a config fix was applied, because of the next issue:
+Alloy's config first pointed at `kube-prometheus-kube-prome-prometheus.monitoring.svc.cluster.local` — resolvable only inside `aks-mon`, and Alloy runs in `aks-app`. The failure persisted after the fix was written, for a second reason: the fix's own comment used `#` instead of `//`. Alloy's config language isn't YAML — it borrows Go's comment syntax — and the `#` caused a hard parse failure on every reload, which meant the previous, broken config kept running underneath, silently. What looked like one stubborn failure was actually two, stacked. The lesson that mattered more than the fix itself: when a change doesn't seem to take effect, check whether it actually loaded before re-diagnosing the original symptom.
 
-### 11. Alloy configuration syntax: `#` is not a comment
+### 10. Terraform idempotency, and one deliberate risk worth naming honestly
 
-A configuration update — replacing the broken DNS name with the correct private IP — included an explanatory `#`-style comment. Alloy's configuration language is not YAML; it uses `//` for comments, borrowed from Go. The `#` character caused a hard parse failure (`illegal character U+0023 '#'`) on every reload attempt, which meant the **previous, broken** configuration kept running silently underneath — producing a confusing stretch of identical-looking DNS-lookup failures that were, in fact, two different failures (the original DNS mistake, then a config that could never load at all) layered on top of each other. The fix was mechanical (`#` → `//`); the lesson was procedural: **when a fix doesn't appear to take effect, confirm the fix actually loaded before re-diagnosing the original symptom** — check log timestamps against when the change was applied.
+`apply` run twice with nothing changed reliably reported `0 added, 0 changed, 0 destroyed`. A recurring, harmless exception was AKS's own default `upgrade_settings` reasserting itself between sessions — flagged as drift each time, resolved identically each time.
 
-### 12. Terraform idempotency, demonstrated and, once, deliberately risked
+Two separate incidents, worth keeping apart:
 
-`terraform apply` run twice with no intervening change reliably reported `0 added, 0 changed, 0 destroyed`. A recurring, harmless exception was AKS's own default `upgrade_settings` block re-asserting itself on the node pool between sessions — Terraform correctly flagged it as drift each time, and re-applying (removing the block, since it was never declared) resolved it identically every time.
+- A genuine `Unexpected Identity Change` error on `kubernetes_service.loki_lb` — a provider-level issue, not something this project's own code caused. The `kubernetes` provider added a resource-identity tracking feature after this resource's state was created, found a stale/empty identity, and refused to reconcile rather than backfill it. Fixed cleanly with `terraform state rm` followed by `terraform import` — pure bookkeeping, the live object was never touched.
+- A separate anti-pattern worth calling out on its own: at one point, a required RBAC role assignment was granted manually through the Azure CLI while a `terraform apply` was still running in another terminal, specifically to avoid waiting. It didn't collide this time, but it left a role assignment Terraform's own config would otherwise have tried to create a redundant copy of — reconciled afterward with `terraform import`. Running an independent mutation against a Terraform-managed resource while an apply is in flight is a bad habit regardless of whether it happens to collide. Letting the apply finish or fail, then fixing forward, is the safer path.
 
-Two separate incidents here, worth keeping distinct rather than merging into one story:
+### 11. A restarted cluster doesn't guarantee the same pod, and Loki logs don't follow a pod across that gap
 
-- **The actual `Unexpected Identity Change` error** hit on `kubernetes_service.loki_lb` — a Terraform *provider* bug, not something this build's own code caused. The `kubernetes` provider added a newer "resource identity" tracking feature; this resource's state predated it, so the provider found a stale/empty identity in state and refused to reconcile rather than backfilling it. Fixed cleanly with `terraform state rm kubernetes_service.loki_lb` followed by `terraform import kubernetes_service.loki_lb monitoring/loki-lb` — pure state bookkeeping, the live object was untouched throughout.
-- **A separate anti-pattern, worth calling out on its own merits:** at one point a required Azure RBAC role assignment was granted **manually via `az cli`** while a `terraform apply` was still running in another terminal (waiting on an unrelated `LoadBalancer` to get its IP), specifically to unblock that wait faster. It didn't produce an identity-change conflict — but it did leave a role assignment that Terraform's own config would otherwise have tried to create a second, redundant copy of, reconciled afterward with `terraform import` instead. **Running an independent mutation against a Terraform-managed resource while an apply is in flight is unsafe as a habit**, even when it happens not to collide this time — the safer path is letting an apply finish or fail cleanly, then fixing forward.
+After stopping and restarting both clusters between sessions, the demo app came back as a different pod — same Deployment, new name. Querying Loki for the original pod's logs, hours later, against the new pod, returned nothing — not because Loki was broken, but because that pod's log stream genuinely doesn't exist anymore to query.
 
-### 13. A stopped/started cluster doesn't guarantee the same pod identity — and Loki logs don't follow a pod across that gap
-
-After stopping and restarting both clusters between working sessions, the demo application's pod had a **different name** than the one that generated the original, already-verified trace — `demo-app-6f86d67dc8-qw92n` instead of `demo-app-6f86d67dc8-dl45v`, same Deployment and ReplicaSet, new pod identity. Querying Loki for the *original* pod's log lines (hours later, against the new pod) returned nothing — not because Loki was broken, but because that pod's log stream genuinely no longer exists to be queried, regardless of whether the underlying chunk data is still in retention.
-
-This didn't affect the already-captured trace — Tempo stores spans by trace ID, independent of whether the originating pod is still running, so the original `230.64ms` trace remained fully valid and viewable. But it meant the "click a trace, find its matching log line" workflow only works reliably **within the lifetime of the pod that generated both** — a genuinely useful operational fact to know before relying on this pattern days after the fact. The correlation was re-verified cleanly by generating a fresh request against the current pod and confirming both signals landed and matched within minutes, rather than trying to recover the original pair.
+This didn't touch the already-captured trace — Tempo stores by trace ID, independent of whether the originating pod still exists, so the original trace stayed fully valid. But it means the "click a trace, find its matching log" workflow only reliably works within the lifetime of the pod that generated both signals — worth knowing before relying on it days later. Re-verified cleanly by generating a fresh request and matching both signals within minutes rather than trying to recover the original pair.
 
 ---
 
 ## Cost and Cleanup
 
-Every component in this build carries a real cost while running:
+Everything here costs something while running:
 
-- **Two AKS clusters** — node compute is the largest ongoing cost. `az aks stop` deallocates node VMs (billing drops to near-zero for compute) but does **not** delete the cluster object, its managed identities, or any `LoadBalancer`-type Kubernetes Services.
-- **`type: LoadBalancer` Services** provision a real Azure Load Balancer plus, for public ones, a Public IP — both billed **independently of cluster power state**. Grafana's Service in this build is public and was explicitly deleted (`kubectl delete service grafana -n monitoring`) between working sessions specifically because `az aks stop` does not touch it.
-- **Storage** — negligible at this data volume, but non-zero and ongoing.
-- **Two Prometheus replicas** roughly double both scrape load on every target and local disk consumption compared to a single instance — a direct, load-bearing cost of the HA design, not free.
-- **Thanos long-term storage** accumulates in Blob Storage indefinitely (no Compactor is deployed to deduplicate or expire old data in this build — see [Thanos](#thanos)), so storage cost grows over time even though it's currently small.
+- **Two AKS clusters** are the largest ongoing cost. `az aks stop` deallocates node compute but doesn't delete the cluster object, its managed identities, or any `LoadBalancer` Services.
+- **`LoadBalancer` Services** provision a real Azure Load Balancer and, for public ones, a Public IP — billed independently of cluster power state. Grafana's Service here is public and was explicitly deleted between sessions for exactly that reason.
+- **Storage** is negligible at this data volume, but non-zero and ongoing.
+- **Two Prometheus replicas** roughly double scrape load and local disk usage over a single instance — a direct cost of the HA design.
+- **Thanos storage** accumulates indefinitely with no Compactor to deduplicate or expire it, so it grows over time even though it's small right now.
 
-**Between sessions**, the discipline used throughout this build:
+Between sessions:
 
 ```bash
 kubectl delete service grafana -n monitoring
-az network lb list -g MC_rg-obs-day2_aks-mon_southindia --query "[].name" -o table   # confirm gone
+az network lb list -g MC_rg-obs-day2_aks-mon_southindia --query "[].name" -o table
 az aks stop -g rg-obs-day2 -n aks-mon --no-wait
 az aks stop -g rg-obs-day2 -n aks-app --no-wait
 ```
 
-**To tear the entire lab down permanently:**
+To tear the whole thing down:
 
 ```bash
 terraform destroy
 ```
 
-`terraform destroy` removes everything Terraform's state tracks — both clusters (and, since they're the *owner* of their `MC_*` managed resource groups, everything Azure created on their behalf: node VMSS, disks, internal load balancers), both VNets and the peering, the storage account and its containers, and all three identities and their role assignments. Deleting a single Kubernetes Service (as done for Grafana between sessions) only removes that one Service and whatever cloud resource it provisioned — it is not a substitute for `terraform destroy` and leaves everything else running and billing.
+That removes everything Terraform's state tracks — both clusters and everything Azure created on their behalf, both VNets and the peering, storage, and all three identities and their role assignments. Deleting one Kubernetes Service, as done for Grafana between sessions, only removes that one Service — it's not a substitute for `terraform destroy`.
 
 ---
 
 ## CI/CD — Future Work
 
-No CI/CD pipeline exists in this repository as of this writing. A realistic future shape, given the architecture:
+Nothing exists here yet. A realistic shape, given the architecture:
 
 ```
 Code → Git → CI runner
   → terraform validate
-  → terraform plan (posted as a PR comment for review)
-  → terraform apply (on merge, with manual approval gate)
-  → helm/kubectl-based smoke checks (pod readiness, datasource Save & Test equivalents)
-  → observability self-check (query Thanos for alloy_build_info, confirm the
-     pipeline proved out in this README is still intact)
+  → terraform plan (posted for review)
+  → terraform apply (on merge, with an approval gate)
+  → smoke checks (pod readiness, datasource Save & Test equivalents)
+  → an observability self-check (query alloy_build_info through Thanos,
+     confirming the pipeline documented in this README is still intact)
 ```
 
-This is explicitly a proposal, not an implementation.
+A proposal, not an implementation.
 
 ---
 
 ## Testing — Future Work
 
-No automated test suite (pytest or otherwise) exists in this repository. Every validation documented in this README was performed manually, once, and recorded here. A natural next step, informed directly by this build's own debugging history:
-
-- A small Python/pytest suite asserting the things that were manually re-verified by hand repeatedly during this build: each workload's pod carries the correct `azure.workload.identity/use` label (not just the ServiceAccount), each internal LoadBalancer Service actually has a `10.20.0.x` IP (not `<pending>`), Prometheus's `external_labels` are correct when read from the rendered config file, and Thanos Query's `/api/v1/stores` shows exactly two entries with distinct `replica` values.
-- This maps directly onto the same test-layering philosophy documented in this workshop's Day 1 companion project — infrastructure/config-state assertions that catch drift `up`/health checks structurally cannot see.
+No automated suite exists. Every check in this README was done manually, once, and recorded here. A natural next step: a small pytest suite asserting the things that were re-verified by hand repeatedly during this build — each workload's pod carries the identity label (not just the ServiceAccount), each internal LB has a real IP rather than `<pending>`, Prometheus's external labels are correct when read from the rendered config, and Thanos Query's `/api/v1/stores` shows exactly two entries with distinct replica values. This is the same test-layering approach used in this project's Day 1 companion repo — infrastructure and config-state assertions catching drift that a bare health check structurally can't see.
 
 ---
 
 ## What You Will Learn
 
-- Provisioning AKS infrastructure with Terraform, including multi-cluster and multi-provider-alias configurations
-- Managing both Azure infrastructure and in-cluster Kubernetes/Helm resources from a single Terraform state
-- Deploying a full observability stack (Prometheus, Grafana, Thanos, Loki, Tempo, Alloy) via Helm
-- Configuring genuine Prometheus HA, including what it does and does not protect against
+- Provisioning AKS with Terraform, including multi-cluster, multi-provider-alias configurations
+- Managing Azure infrastructure and in-cluster Kubernetes/Helm resources from one Terraform state
+- Deploying a full observability stack via Helm
+- What Prometheus HA actually protects against, and what it doesn't
 - Why StatefulSets exist and what they guarantee that Deployments don't
-- Configuring and validating Prometheus external labels — and why the obvious validation method is often the wrong one
-- The Thanos sidecar/Query architecture and why deduplication requires a shared label convention
-- Azure Blob Storage as a backing store for three different observability systems
-- Implementing Azure Workload Identity end-to-end: ServiceAccount → OIDC → Federated Credential → Managed Identity → RBAC
-- Diagnosing the specific, silent failure mode of workload-identity misconfiguration
-- Applying least-privilege RBAC scoped to individual storage containers
-- Reading and querying with PromQL
-- Debugging Kubernetes/Helm deployments by reading actual chart template source rather than trusting values-file appearances
-- Recognizing and safely resolving Terraform state drift, including state caused by out-of-band manual changes
-- The real cost and cleanup implications of `LoadBalancer` Services versus cluster power state
+- Validating Prometheus external labels correctly — and why the obvious method is the wrong one
+- The Thanos sidecar/Query split and why deduplication needs a shared label convention
+- Blob Storage as a backing store for three different observability systems
+- Azure Workload Identity end to end: ServiceAccount → OIDC → Federated Credential → Managed Identity → RBAC
+- The specific, silent failure mode of a misconfigured workload identity
+- Least-privilege RBAC scoped to individual storage containers
+- PromQL
+- Debugging Helm deployments by reading chart template source, not just the values schema
+- Recognizing and resolving Terraform state drift, including drift caused by out-of-band changes
+- The real cost and cleanup difference between a `LoadBalancer` Service and cluster power state
 
 ---
 
 ## Interview Questions
 
 **Why a StatefulSet instead of a Deployment for Prometheus?**
-A StatefulSet gives each pod a stable, predictable identity and reattaches it to the *same* PersistentVolumeClaim on every reschedule. That stability is what makes the `replica` external label — and therefore Thanos deduplication — meaningful; a Deployment's interchangeable, randomly-named pods would break that association.
+It gives each pod a stable identity and reattaches it to the same PersistentVolumeClaim on every reschedule. That stability is what makes the `replica` label — and therefore Thanos deduplication — mean anything; a Deployment's interchangeable pods would break the association.
 
 **Why two Prometheus replicas?**
-A single Prometheus is monitoring's own single point of failure — and the thing that dies is the thing that would have told you something else was wrong. Two independent replicas cover the window while one is down or being rescheduled.
+A single instance is monitoring's own single point of failure, and it's the thing that would have told you something else broke. Two independent replicas cover the window while one is down or rescheduling.
 
-**Why are the replicas not synchronized?**
-Each replica runs its own independent scrape loop on its own timer. There's no coordination mechanism between them by design — coordinating scrape timing across replicas would add complexity for no real benefit, since the goal is availability, not identical data.
+**Why aren't the replicas synchronized?**
+Each runs its own scrape loop on its own timer, by design — coordinating them would add complexity for no real benefit, since the goal is availability, not identical data.
 
-**Why is the `replica` external label necessary?**
-Without it, Thanos Query has no way to distinguish "two different metrics" from "the same metric reported by two replicas." Every query would double-count, and every graph would show duplicate, slightly-offset lines.
+**Why does the `replica` label matter?**
+Without it, Thanos Query can't tell two different metrics apart from the same metric reported twice. Every query would double-count.
 
 **Why does Grafana query Thanos instead of Prometheus directly?**
-Querying a replica directly returns only that replica's view, with no indication anything is missing during its downtime. Thanos Query merges both replicas and deduplicates — Grafana gets one correct answer regardless of which replica is currently up.
+A direct query only shows one replica's view, with no signal that anything's missing during its downtime. Thanos Query merges both and deduplicates — Grafana gets one correct answer regardless of which replica is up.
 
 **What happens if Prometheus-0 goes down?**
-Thanos Query continues serving data from Prometheus-1's sidecar. Grafana dashboards are unaffected, modulo the brief data gap inherent to any restart.
+Thanos Query keeps serving from Prometheus-1's sidecar. Dashboards are unaffected beyond the brief gap any restart causes.
 
-**What happens if both replicas have the same configuration mistake?**
-Both fail identically. HA protects against one replica's *availability* failing, not against a shared *configuration* being wrong — a bad scrape config or alert rule is replicated to both instances exactly.
+**What happens if both replicas share the same misconfiguration?**
+Both fail identically. HA protects against one replica's availability, not against a shared bad config.
 
-**Why use Workload Identity instead of a storage account key?**
-No long-lived credential exists to leak. The token auto-rotates (roughly hourly), and — critically — it's scoped precisely to what RBAC grants, whereas a storage account key grants full account access regardless of what any one workload actually needs.
+**Why Workload Identity over a storage account key?**
+Nothing long-lived exists to leak, the token auto-rotates roughly hourly, and it's scoped to exactly what RBAC grants rather than the whole account.
 
 **What is a Federated Identity Credential?**
-The Azure-side trust relationship stating "tokens signed by this specific Kubernetes cluster's OIDC issuer, for this exact ServiceAccount (`system:serviceaccount:<namespace>:<name>`), may be exchanged for a real Azure AD token." It's what turns a Kubernetes-native identity into an Azure-native one, with no shared secret between them.
+The Azure-side trust statement that tokens from this specific cluster's OIDC issuer, for this exact ServiceAccount, can be exchanged for a real Azure AD token. It's what turns a Kubernetes-native identity into an Azure-native one with no shared secret.
 
 **What does `Storage Blob Data Contributor` grant?**
-Read, write, and delete on blob *data* within its scope. It does not grant management-plane rights like creating or deleting containers or changing account configuration.
+Read, write, delete on blob data within its scope — not management-plane rights like creating or deleting containers.
 
-**Why separate Blob container permissions per identity?**
-Least privilege, made concrete: a compromised Thanos pod can only reach the `thanos` container — not `loki-chunks`, not `tempo-traces` — because the RBAC scope is the container's own resource ID, not the storage account's.
+**Why separate Blob permissions per identity?**
+Least privilege made concrete: a compromised Thanos pod can only reach the `thanos` container, because the RBAC scope is the container's own resource ID, not the account's.
 
-**Why is `editable: false` useful on a Grafana datasource?**
-It prevents an admin from changing connection details through the UI, so the only way the datasource configuration can change is through Terraform — keeping the declared and running states from silently diverging.
+**Why is `editable: false` useful on a datasource?**
+It keeps the only path to changing the config as Terraform, so declared and running state can't quietly diverge.
 
 **What happens when a `LoadBalancer` Service is deleted?**
-The associated cloud load balancer (and, for a public Service, its Public IP) is deprovisioned along with it — the cloud controller manager reconciles in both directions, creation and deletion.
+The cloud load balancer, and any Public IP, get deprovisioned with it — the controller reconciles both ways.
 
-**Why doesn't `az aks stop` have the same effect as deleting the LoadBalancer Service?**
-`az aks stop` deallocates node compute. A `LoadBalancer` Service's cloud resource is provisioned independently of node state (by the cloud-controller-manager, in response to the Service object existing) and keeps billing — and, for a public one, keeps being internet-reachable — even with every node stopped.
+**Why doesn't `az aks stop` do the same thing?**
+It deallocates node compute. A `LoadBalancer` Service's cloud resource is provisioned independently of node state and keeps billing, and for a public one, keeps being reachable, even with every node stopped.
 
-**Why use Terraform state at all?**
-It's the record of what Terraform actually manages. Without it, Terraform would have no way to know whether a resource already exists, what its current attributes are, or what needs to change — every `plan` would have to guess.
+**Why bother with Terraform state at all?**
+It's the only record of what Terraform actually manages. Without it, every plan would have to guess whether something exists.
 
-**What does idempotency mean here, concretely?**
-Running `apply` against unchanged infrastructure produces `0 changed`. It's what makes it safe to re-run Terraform repeatedly, in automation or by hand, without risk of duplicating or corrupting anything.
+**What does idempotency mean here?**
+Running `apply` against unchanged infrastructure changes nothing. It's what makes it safe to re-run, by hand or in automation, without risking duplication or corruption.
 
-**Why avoid unnecessary `depends_on`?**
-Terraform infers ordering from references automatically — a resource attribute used inside another resource's arguments creates the dependency edge for free, and that inferred graph enables real parallelism. `depends_on` is only needed when a real dependency exists that the code doesn't otherwise express (e.g., a hardcoded DNS string with no Terraform attribute behind it) — reaching for it by default hides the actual relationship instead of declaring it.
+**Why avoid `depends_on` where you can?**
+Terraform infers ordering from references for free, and that inferred graph is what enables real parallelism. `depends_on` is for the cases the code genuinely can't express any other way — a hardcoded string with no attribute behind it, for instance.
 
-**Why use two AKS clusters instead of one?**
-Isolation of blast radius and an explicit, auditable trust boundary between the systems being observed and the observability platform itself — see [Design Deep Dives](#why-two-aks-clusters).
+**Why two AKS clusters instead of one?**
+Blast-radius isolation and an explicit, auditable boundary between what's being observed and what's observing it.
 
 ---
 
 ## Future Improvements
 
-- **Bump the Alloy chart version.** `alloy.tf` currently pins `version = "~> 0.11"`, which resolves to chart `0.11.0` — Alloy binary **v1.6.1**, versus the current release line (**v1.19.x** at time of writing). This was never deliberately chosen; it's a stale placeholder that happened to still resolve without error. Before relying on this build for anything beyond learning, bump to a current `~> 1.x` chart version and re-verify the River config's components still match that version's syntax.
-- Deploy Thanos Compactor to deduplicate and expire the two overlapping per-replica copies currently accumulating in the `thanos` container
-- Deploy Thanos Store Gateway for efficient historical queries
-- Split the Terraform working directory into `modules/` (network, cluster, identity, observability-stack) for reuse
-- Add the CI/CD pipeline described above
-- Add the pytest-based infrastructure/config-state suite described above
-- Move the demo application off `pip install`-at-startup to a properly built and pushed container image (requires provisioning Azure Container Registry)
-- Scope the AKS cluster's `Network Contributor` grant on `vnet-mon` more narrowly than the whole VNet, if a narrower built-in or custom role can cover exactly what internal LoadBalancer provisioning needs
-- Generate a static `docs/day2-architecture.png` from the Mermaid source for use outside GitHub
+- **Bump the Alloy chart version.** `alloy.tf` currently pins `~> 0.11`, resolving to chart 0.11.0 and Alloy binary v1.6.1, against a current release line around v1.19.x. That was never a deliberate choice — it's a stale placeholder that happened to keep resolving without error. Worth bumping to a current `~> 1.x` and re-checking the config syntax still matches before relying on this for anything beyond learning.
+- Deploy a Thanos Compactor, to stop the two overlapping per-replica copies in `thanos` from accumulating indefinitely
+- Deploy a Thanos Store Gateway for efficient historical queries
+- Split the Terraform directory into `modules/` for reuse
+- Build the CI/CD pipeline sketched above
+- Build the pytest-based infrastructure suite sketched above
+- Move the demo app off `pip install`-at-startup to a properly built image, once there's a registry to push to
+- Narrow the AKS cluster's `Network Contributor` grant on `vnet-mon`, if a tighter built-in or custom role can cover exactly what internal LB provisioning needs
+- Generate a static `docs/day2-architecture.png` from the Mermaid source
 
 ---
 
 ## Portfolio Summary
 
-This project demonstrates practical, hands-on experience building a production-shaped observability platform on Azure: two-cluster Kubernetes network isolation, Prometheus high availability with Thanos-based long-term storage and deduplication, log and trace pipelines via Loki, Tempo, and Grafana Alloy, and Azure Workload Identity implemented end-to-end with zero static credentials — all provisioned as Infrastructure as Code with Terraform, managing both Azure resources and in-cluster Kubernetes/Helm deployments from a single state.
+This is a working, end-to-end observability platform on Azure: two isolated Kubernetes clusters, Prometheus running highly available with Thanos handling long-term storage and deduplication, logs and traces through Loki, Tempo, and a single Grafana Alloy collector, and Azure Workload Identity wired through every component that touches storage — no static credentials anywhere. All of it, including the in-cluster Helm layer, is provisioned by Terraform from one state file.
 
-It also documents, honestly, the debugging process behind it: real Helm chart schema mismatches across four different charts, a genuine Terraform/Kubernetes resource-ownership conflict, an Azure quota constraint that shaped real architectural decisions, and the specific silent failure mode of a misconfigured workload identity — the kind of troubleshooting depth that only comes from actually building the thing.
+The Challenges section above isn't padding. Four separate Helm charts each hid real configuration behavior somewhere their values schema didn't make obvious, and finding each one meant reading the chart's actual template source rather than trusting what looked plausible. An Azure quota constraint forced a real node-sizing decision partway through, not a hypothetical one. And a misconfigured workload identity fails in a genuinely specific, silent way — a healthy pod, no error, and a symptom that surfaces two or three layers downstream from the actual cause — which is exactly the kind of thing you only really learn by hitting it.
 
-**Skills demonstrated:** Azure · AKS · Terraform · Kubernetes · Helm · Prometheus · Grafana · Thanos · Loki · Tempo · OpenTelemetry · Azure Blob Storage · Azure Workload Identity (OIDC federation) · Infrastructure as Code · Observability architecture · HA system design · Cloud cost management · Systematic troubleshooting
+Technologies: Azure, AKS, Terraform, Kubernetes, Helm, Prometheus, Grafana, Thanos, Loki, Tempo, OpenTelemetry, Azure Blob Storage, Azure Workload Identity, infrastructure as code, HA system design, cloud cost management.
 
 ---
 
-*Built as Day 2 of a self-directed Azure observability learning path, following on from a single-VM Prometheus/Grafana build in Day 1.*
+*Built as the second stage of a self-directed Azure observability project, following a single-VM Prometheus/Grafana build.*
