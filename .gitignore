@@ -1,0 +1,12 @@
+# State can contain secrets in plain text. Never commit it.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl.bak
+
+# Variable files often hold real values
+*.tfvars
+!example.tfvars
+
+# OS artifacts
+.DS_Store
